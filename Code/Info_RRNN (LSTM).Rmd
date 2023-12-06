@@ -1,0 +1,1043 @@
+---
+title: "RRNN (LSTM)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+## **1.3 Machine learning with direct forecasts**
+
+-   Now the output is multi-dimensional
+
+-   To forecast t+h values, we need to develop h ML tools, one for each value to be forecasted
+
+-   Advantage: we don't need to assume future forecasts are real values
+
+-   Disadvantage: we need to train many models and cannot consider the dependencies between the predictions
+
+The hh-step ahead forecasts are computed in a direct way:
+
+prediction(t+1) = Model1(obs(t-1), obs(t-2), ..., obs(t-n))
+
+prediction(t+2) = Model2(obs(t-2), obs(t-3), ..., obs(t-n))
+
+\
+
+The next tool, RNN, shares the same spirit and it is more advanced, but more black box...
+
+## **1.4 Recurrent Neural Networks**
+
+-   Neural networks can model any non-linear function (relation)
+
+-   RNNs (Recurrent Neural Networks) are promising tools for sequential data (time series), especially succesful in Natural Language Processing and Speech Recognition
+
+-   Good performance for complex time-series: high-frequency, non-linear, high volatility, etc.
+
+-   Although it is a complete black box and difficult to use it at the beginning
+
+-   Very good to capture non-linear relationships, but needs the series to be somehow stationary (*normalization*)
+
+Hence, RNN are **multiple output** tools: one model is able to forecast all the hh-step ahead forecasts in one shot:
+
+prediction(t+1), prediction(t+2) = model(obs(t-1), obs(t-2), ..., obs(t-n))
+
+Of course, they are more complex and slower to train, and require more data to predict better
+
+## **2.2 Load data and libraries**
+
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(zoo)
+library(TSstudio)
+library(forecast)
+library(caret)
+library(keras)
+
+ts.data = read_csv("SmartMetersLondonACORN-A.csv", col_names = TRUE)
+
+ts.data$X1=NULL
+ts.data$Month = factor(ts.data$Month)
+ts.data$Hour = factor(ts.data$Hour)
+ts.data$DayOfWeek = factor(ts.data$DayOfWeek)
+
+id.client=names(dplyr::select(ts.data, starts_with("MAC")))
+N = length(id.client)
+N
+
+```
+
+```{r}
+
+dim(ts.data)
+```
+
+## **2.3 Visualization: smart graphs**
+
+Two homes, by chance
+
+```{r}
+
+j = 18
+id = id.client[j]
+ts.data %>%
+ggplot(aes_string(x = "time", y = id)) + geom_line(color = "lightblue") +
+      labs(title = "Consumption, customer 18th", y = "kWh", x = "") + theme_bw()
+
+```
+
+Difficult to get any information
+
+Explore the daily seasonality
+
+```{r}
+
+j = 18
+id = id.client[j]
+ts.data %>% 
+ggplot(aes_string("Hour", id)) + geom_boxplot(fill="blue") + xlab("") + theme_bw()  
+
+```
+
+Explore the weekly seasonality
+
+```{r}
+
+j = 18
+id = id.client[j]
+ts.data %>% 
+ggplot(aes_string("DayOfWeek", id)) + geom_boxplot(fill="blue") + xlab("") + theme_bw() 
+
+```
+
+Now much more information
+
+Let's see the relation between consumption and temperature
+
+```{r}
+
+j = 18
+id = id.client[j]
+ts.data %>% 
+ggplot(aes_string("temperature", id)) + geom_point(alpha=0.1) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 1), size = 1) +
+  facet_wrap(~ Month, ncol = 4) + theme_bw() 
+
+```
+
+Much smoother, better predictability
+
+Let's see the relation between toal consumption and temperature
+
+```{r}
+
+ts.data %>% 
+ggplot(aes(x=temperature, y=Total)) + geom_point(alpha=0.1) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 1), size = 1) +
+  facet_wrap(~ Month, ncol = 4) + theme_bw()  
+
+```
+
+A clearer relation
+
+How different are homes in terms of consumption levels and volatility?
+
+```{r}
+
+myFunc <- function(x) c(mean=mean(x), sd=sd(x))
+
+
+dplyr::select(ts.data, starts_with("MAC")) %>% sapply(myFunc) %>% t() %>% data.frame() %>% ggplot(aes(x=sd,y=mean)) + geom_point(alpha=0.9) + xlab("sd (kWh)") + ylab("mean (kWh)") + theme_bw() 
+
+
+```
+
+We need to scale the data
+
+Let's see now the autorelations:
+
+```{r}
+
+j = 18
+id = id.client[j]
+ts.data %>% ggplot(aes(get(id), dplyr::lead(get(id)))) +
+  geom_point() + xlab(expression(C[t-1])) + ylab(expression(C[t]))
+
+j = 92
+id = id.client[j]
+ts.data %>% ggplot(aes(get(id), dplyr::lead(get(id)))) +
+  geom_point() + xlab(expression(C[t-1])) + ylab(expression(C[t]))
+
+# Total consumption
+ts.data %>% ggplot(aes(Total, lead(Total))) +
+  geom_point() + xlab(expression(C[t-1])) + ylab(expression(C[t]))
+
+```
+
+Is it clear how predictability increases with the aggregation?
+
+Or the opposite: as we disaggregate a series, volatility increases (more difficult to predict)
+
+```{r}
+
+j = 18
+z = ts(ts.data[,j+1], start=c(2013,1), freq = 24)
+z = log(z+1)
+Acf(z, lag.max=50)
+
+```
+
+```{r}
+
+Pacf(z, lag.max=50)
+
+```
+
+Different meters, different models...
+
+# **4 Neural Networks and Deep Learning**
+
+-   Very flexible and powerful
+
+-   A basic model can obtain good performance over any type of series
+
+-   Can model multi-dimensional time series with complex interactions in a natural way
+
+-   Easy to add exogenous factors (regressors) as a part of the input vector (time series)
+
+-   Let's introduce the framework to use deep learning in Python and R
+
+## **4.1 Tensors**
+
+They are multi-dimensional arrays
+
+-   0D: a number
+
+-   1D: a vector (tensor for univariate statistics)
+
+-   2D: a matrix (tensor for classical classification, regression, ...)
+
+-   3D: an array (tensor for time series)
+
+-   4D: an array (tensor for images)
+
+-   5D: an array (tensor for video)
+
+## **4.2 Tensors for time series**
+
+3D tensors of shape/dimension = (samples, timesteps, features)
+
+-   samples = t
+
+These are independent observations from the domain, typically rows of data
+
+-   timesteps = like seasonality
+
+These are separate time steps of a given variable for a given observation
+
+-   features = regressors
+
+These are separate measures observed at the time of observation
+
+## **4.3 TensorFlow**
+
+-   TensorFlow is an open source software library for numerical computations written in C++ (not confined to NNs)
+
+-   Originally developed by researchers in Google to perform distributed computation, deal with large datasets, automatic differentiation, optimization algorithms, etc.
+
+-   The core TensorFlow API is written in Python
+
+-   But we can use the R API to access TensorFlow
+
+-   See <https://tensorflow.rstudio.com/tensorflow>
+
+## **4.4 Keras**
+
+-   Keras is a high-level neural networks API, written in Python and running on top of TensorFlow (or CNTK or Theano)
+
+-   Hence, it is an easy API for doing deep learning
+
+-   The Keras R API calls the Keras Python API, which calls the core Python TensorFlow API which calls the TensorFlow C++ library
+
+-   See <https://tensorflow.rstudio.com/keras/>
+
+## **4.5 Installing Keras and TensorFlow**
+
+```{r}
+
+install.packages("devtools")
+library(devtools)
+devtools::install_github("rstudio/keras")
+library("keras")
+install_keras()
+
+library("keras")
+
+```
+
+## **4.6 Neural Networks and Deep Learning**
+
+-   The new hype: Artificial Intelligence and Deep Learning
+
+-   Incredible success in applications like image recognition (diagnosis in medical imaging), natural language processing (virtual personal assistants, language translator), automated trading, autonomous cars, drug discoveries, recommendation systems, ...
+
+-   Easy to understand if you know Logistic Regression:
+
+    -   Artificial Neural Networks are like many logistic regressions interconnected through a network
+
+    -   Each logistic regression is a single layer perceptron (one node in the network)
+
+    -   The logistic function is now called sigmoid (a type of activation function)
+
+    -   Layers: transformation function on the data that goes from an input to an output (transformations must be differentiable for stochastic gradient descent)
+
+## **4.7 Single Layer Perceptron**
+
+![](C:/Users/FAL/AppData/Local/RStudio/tmp/paste-BBD116C0.png)
+
+Example with 4 predictors (plus constant 1) and one output (yes or no, binary classification)
+
+## **4.8 Multi-Layer Perceptron**
+
+How to incorporate non-linearities and interactions?
+
+-   Add more layers and perceptrons (nodes)
+
+-   In theory, NNs can model any non-linear relationship
+
+![](C:/Users/FAL/AppData/Local/RStudio/tmp/paste-3E81282F.png)
+
+Neural network: many layers (in the graph an input layer, a hidden layer, and an output layer with the scores of 3 classes or groups)
+
+## **4.9 Activation functions**
+
+The activation function, like the sigmoid, must be non-linear, otherwise the NN would be just a single layer perceptron
+
+Its value is the input for next neurons
+
+![](C:/Users/FAL/AppData/Local/RStudio/tmp/paste-1203E4A5.png)
+
+## **4.10 Deep Learning**
+
+-   Can we add just more hidden layers to improve performance? Yes!
+
+-   This is called deep learning = deep neural networks
+
+-   Take care: the Universal Approximation Theorem says you can approximate any continuous function using a NN with just a single hidden layer
+
+-   Hence, in theory no need of more than one hidden layer
+
+-   But DL fits a problem faster in practice
+
+-   DL estimates the weights in the NN by minimizing a differentiable loss function through the (mini-batch) gradient descent method, computing the derivatives using back-propagation (chain's rule). In practice, millions of parameters to estimate in a highly non-linear function
+
+-   In general, larger networks tend to predict better than smaller networks, but overfitting should be avoided through regularization
+
+-   Use Keras and TensorFlow in practice to select network topology, optimization algorithm, activation function, etc.
+
+-   Feature engineering is done during the process (along the layers), i.e. no need to perform previous feature engineering
+
+## **4.11 The loss function and backpropagation**
+
+-   The loss function compares the predictions with the true targets and computes a distance score
+
+-   In deep learning, this score is used as a feedback signal to adjust the weights using optimization
+
+-   Updates are done via the backpropagation algorithm (the chain rule) to iteratively compute gradients for each layer
+
+-   To improve performance, stochastic gradient descent is used
+
+# **5 Recurrent Neural Networks**
+
+A special NN but with a new layer where the output acts as the input in next iterations
+
+In spirit similar to a Markov chain or an *AR(p)*
+
+![](C:/Users/FAL/AppData/Local/RStudio/tmp/paste-D3701453.png)
+
+Other view:
+
+![](C:/Users/FAL/AppData/Local/RStudio/tmp/paste-4823F5C4.png)
+
+## **5.1 LSTM**
+
+-   The Long Short-Term Memory network (LSTM) is a type of Recurrent Neural Network (RNN)
+
+-   Advanced version to avoid gradients vanish to zero too early (preserve information)
+
+-   We can build an LSTM model using the keras_model_sequential() and adding layers in a easy way
+
+![](C:/Users/FAL/AppData/Local/RStudio/tmp/paste-C631A19F.png)
+
+## **5.2 LSTM: notation I**
+
+-   Need to transform input data into tensors
+
+-   Imagine we want to fit an AR(24) model in a non-linear way
+
+-   The input matrix contains then T rows and 24 columns, one for each lag
+
+-   The target matrix contains then T rows and h columns, one for each horizon forecast
+
+```{r}
+x.train = data.matrix(x.train.lag)
+dim(x.train) = c(dim(x.train)[1], 24, 1)
+
+y.train = data.matrix(y.train.lag)
+dim(y.train) = c(dim(y.train)[1], h, 1)
+
+```
+
+-   The 1 in the third dimension means we are measuring one feature (consumption itself) for each time step
+
+-   But we could add more regressors for each time step
+
+## **5.3 LSTM: notation II**
+
+-   units = number of neurons in a layer
+
+-   The first LSTM layer takes the required input shape
+
+-   batch size = fixed-sized number of rows from the training set (by chance, to improve performance in SGD)
+
+-   For example we are going to choose 360 days as the batch size to train several years of hourly data
+
+-   epochs: number of times the optimization uses the complete training set (in our case the complete time series)
+
+-   In our LSTM, we need a single neuron in the output layer with a linear activation to predict the series at the next time step
+
+-   Keras provides a TimeDistributed layer to get multi-step forecasts
+
+## **5.4 LSTM: notation III**
+
+-   Imagine we want to forecast the next 24 hours of data, where there is a 168-hours season (weekly)
+
+-   we'll use x for the predictors, and y for the target/label
+
+-   if we have 5 years of data and 3 regressors, then dim(x) = (365x5x24, 168, 3)
+
+-   And dim(y)=(365x5x24, 24), i.e. for each day (in a row) we have the next 24 hours we want to predict
+
+-   Hence, for each given day, we use the last 168 hours information (including regressors) to forecast the next 24 hours
+
+-   To improve performance, instead of using the 365x5x24 hours in each iteration (SGD), we'll use a sample of 360 (like they were days)
+
+-   Then the RNN learns from the first day to the last day, trying to forecast 24 values each time
+
+## **5.5 Example**
+
+```{r}
+model <- keras_model_sequential()
+
+model %>%
+  layer_lstm(
+    units = 10, 
+    # the first dim can be ommited:
+    input_shape = c(24,1),
+    # to get multi-step forecasts
+    return_sequences = TRUE) %>% 
+    # TimeDistributed layer to get multi-step forecasts
+    time_distributed(layer_dense(units = 1)) 
+    # by default, linear activation in output layer
+
+model %>%
+  compile(
+    loss = "mae",
+    optimizer = "sgd")
+
+history <- model %>% fit(
+  x.train, y.train,
+  batch_size = 360,
+  epochs = 10,
+  validation_split = 0.2
+  # Hold out 20% of the data for validation
+)
+
+
+```
+
+## **5.6 Normalization**
+
+-   In the same way we need to perform differences in time series to obtain stationary series, the LSTM requires the input data to be centered and scaled
+
+-   Ideally we need to remove also the season... but LSTM is able to capture it usually...
+
+-   The prior steps usually needed are:
+
+    -   Detrend
+
+    -   Deseasonalize
+
+    -   Scale (normalize)
+
+## **5.7 Dropout and Regularization**
+
+A way to deal with overfitting in recurrent layers and improve performance
+
+-   **Regularization:** reduces complexity of the model (network), adding some bias but reducing the variance. It is usually a l1l1 or l2l2 penalization (lasso or ridge)
+
+It can be implemented in any layer, and the penalty parameter should be provided
+
+-   **Dropout:** It makes 0 randomly some units in the layer during the training steps
+
+Every recurrent layer in Keras has two dropout-related arguments: dropout, the drop rate for input units of the layer, and recurrent_dropout, the dropout rate of the recurrent units
+
+# **6 The backtesting**
+
+```{r}
+ T = dim(ts.data)[1]
+  h = 24      # forecasting horizon
+  t.step = 24 # memory in LSTM, similar in spirit as AR(t.step)
+  # Note t.step is indeed an hyper-parameter
+  n.days = 1 # predict only every n.days, that is every 24*n.days hours
+  m.start = 1 # when to start the out-of-sample evaluation, the minimum value is m.start = 1
+  n.features = 33 # it's number of features + main variable: Total+temp+hum+23*Hour+6*Day+Consumption
+  # should be equal to dim(ts.data)[2]-N-2
+  # try also 1 which is equivalent to no features
+  
+  # Hyper-parameter:
+  month = max(min(round(450000/(30*24*N)), 10), 1)
+  M = 30*24*month # estimation window: between 1 and 10 months, depending on N
+
+  # Select here number of clients in training set
+  Nt = round(N*.8)
+  subN = 1:Nt # all clients
+  Nn = length(subN)
+  
+  j = 0 # to count out-of-sample errors or backtest repetitions
+  
+  # Store here all the MAEs (by meter, by date, by model)
+  maeRNN = array(NA, dim=c(N,round((T-h-m.start*M)/24/n.days)+1, 3)) 
+  # 3 is the number of prediction models: RNN and Naive and auto.arima
+  
+  fc.arima = list() # to save individual tbats models, for each smart meter
+  
+  # We have used m.start*M to skip the first m.start months from the evaluation
+  # This is useful when different models are trained with different history (estimation window)
+  # We have used n.days to predict only every 24*n.days hours. Otherwise it'll take so much time...
+  # Remember T=8760 hours...
+  
+  
+  # Change categorical/factor regressors for Neural Networks (encoding): 
+  
+  # Dummies for Hour of Day
+  ts.data = cbind(ts.data, model.matrix(~ Hour, ts.data)[,-1])
+  ts.data$Hour = NULL
+  
+  # Dummies for Day of Week
+  ts.data = cbind(ts.data, model.matrix(~ DayOfWeek, ts.data)[,-1])
+  ts.data$DayOfWeek = NULL
+  
+  # Normalization: either standardization or min-max
+  
+  # Normalize function
+  normalize <- function(vec, mu, sigma) {
+    (vec-mu) / sigma
+  }
+  
+  # De-normalize function
+  denormalize <- function(vec, mu, sigma) {
+    mu + sigma*vec
+  }
+  
+  # The backtesting
+  for (t in (m.start*M):(T-h)) {
+    
+    if ((t %% (24*n.days))==0) { # predict only every 24*n.days hours
+      
+      j = j+1
+      
+      cat("j=",j, "t=", t, "; ") 
+      
+      for.rnn = matrix(NA, N, h) # update here forecasts for rnn
+      Ztest = matrix(NA, N, h) # ztest for each smart meter
+      X.train = array(NA, dim=c(Nn*(M-h-t.step+1), t.step, n.features))
+      X.test  = array(NA, dim=c(N, t.step, n.features))
+      Y.train = matrix(NA, Nn*(M-h-t.step+1), h)
+      Y.test = matrix(NA, N, h)
+      
+      # Store here the parameters (mu and sigma) of the normalization for each smart meter
+      ParamNormalization=data.frame(matrix(NA, nrow = N, ncol = 2))
+      names(ParamNormalization) = c("mu", "sigma")
+      
+      # Loop for the smart meters
+      nn = 0
+      for (n in 1:N){
+        
+        nn = nn + 1
+        
+        # A time-series format for each meter
+        z = ts(ts.data[,nn+1], start=c(2013,1), freq = 24)
+        z = log(z+1)
+        T = length(z) 
+        
+        # Train and test partition of a time series
+        ztrain = ts(z[(t-M+1):t], freq=24)
+        ztest = exp(z[(t+1):(t+h)])-1  
+        
+        # Naive forecast
+        fc.naive.seas = forecast(Arima(ztrain, order=c(0,0,0), seasonal=list(order=c(0,1,0), period=24)), h)$mean
+        fc.naive.seas = exp(fc.naive.seas)-1
+        maeRNN[nn,j,2] = sum(abs(fc.naive.seas - ztest))/h
+        
+        # auto.arima train, just once:
+        if (j==1){    
+          
+          # ztrain2S <- msts(ztrain[(M-1440+1):M], seasonal.periods=c(24,168))  
+          # fc.tbats[[nn]] = tbats(ztrain2S)
+          # tbats forecast
+          # ztrain2S <- msts(ztrain[(M-1440+1):M], seasonal.periods=c(24,168))  
+          #      fc.tbats.fixed = tbats(ztrain2S, model=fc.tbats[[nn]])
+          
+          # auto.arima 
+          fc.arima[[nn]] <- auto.arima(ts(ztrain[(M-168+1):M], freq=24), max.p=2, max.q=1, max.P=1, max.Q=1, seasonal=T)
+        }
+        
+        # auto.arima forecast, all periods and smart meters 
+        fc.arima.fixed = Arima(ts(ztrain[(M-168+1):M],freq=24), model=fc.arima[[nn]])
+        for.arima = pmax(exp(forecast(fc.arima.fixed, h=h)$mean)-1, 0)
+        maeRNN[nn,j,3] = sum(abs(for.arima - ztest))/h
+        
+        # Testing set for all the smart meters
+        Ztest[nn,] = ztest
+        
+        # Normalization
+        ztrain.old = ztrain
+        transf = 1
+        if (transf){
+          
+          muZ = mean(ztrain)
+          sigmaZ = sd(ztrain)
+          if (sigmaZ<=0.00001){sigmaZ=1}
+          ztrain = normalize(ztrain, muZ, sigmaZ)
+          
+          ParamNormalization$mu[nn] = muZ
+          ParamNormalization$sigma[nn] = sigmaZ
+          
+          Y.test[nn,] = normalize(log(ztest+1), muZ, sigmaZ)
+          
+        }
+        
+        
+        # RNN format for regressors. We can add more regressors to the right...
+        # Take care: we are assuming regressors can "see" t+h
+        
+        x.train.reg = dplyr::select(ts.data, Total, temperature, humidity, starts_with("Hour"), starts_with("DayOfWeek"))[(t-M+1+h):(t+h),]
+        
+        # Prepare now x.test for the main variable (feature = 1)
+        x.test = array(0, dim=c(1, t.step, n.features))
+        x.test[,,1] = data.matrix(ztrain[length(ztrain):(length(ztrain)-(t.step-1))])    
+        
+        X.test[nn,,1] = x.test[,,1]
+        
+        # Regressors must be normalized or scaled
+        if (n.features>1){
+          for (jreg in 1:(n.features-1)){
+            # first only strict regressors
+            mu = mean(x.train.reg[,jreg])
+            sigma = sd(x.train.reg[,jreg])
+            x.train.reg[,jreg] = normalize(x.train.reg[,jreg], mu, sigma)
+            
+            # Prepare now x.test for the rest of features 
+            x.test[,,jreg+1] = data.matrix(x.train.reg[length(ztrain):(length(ztrain)-(t.step-1)),jreg])
+            
+            X.test[nn,,jreg+1] = x.test[,,jreg+1]
+            
+          }
+        }
+        
+        if ((nn %in% subN) & (j==1)) { # training set for smart meters
+          
+          # Incorporate lags (like seasonality) into the LSTM
+          lags <- seq(0,t.step-1)
+          # Take care with notation: in design matrix, lags from 0:(t.step-1) and
+          # in target matrix, lags from 1:h
+          dim.tsteps = length(lags)
+          
+          lag_names <- paste("lag", formatC(lags, width = nchar(max(lags)), flag = "0"), sep = "_")
+          lead_names <- paste("H", formatC(1:h, width = 2, flag = "0"), sep = "_")
+          
+          lag_functions <- setNames(paste("dplyr::lag(., ", lags, ")"), lag_names)
+          lead_functions <- setNames(paste("dplyr::lead(., ", 1:h, ")"), lead_names)
+          
+          # Auto-regressor: main variable
+          d = data.frame(z=as.numeric(ztrain))
+          x.train.lag = d %>% mutate_at(vars(z), funs_(lag_functions))
+          x.train.lag$z = NULL
+          
+          regressorlag.list = list()
+          # Regressors
+          if (n.features>1){
+            for (jreg in 1:(n.features-1)){
+              regressor.lag = data.frame(z=x.train.reg[,jreg]) %>% mutate_at(vars(z), funs_(lag_functions))
+              regressor.lag$z = NULL
+              regressorlag.list[[jreg]] = regressor.lag
+            }
+          }
+          # End of regressors
+          
+          # Target variable
+          y.train.lag = d %>% mutate_at(vars(z), funs_(lead_functions))
+          y.train.lag$z = NULL
+          
+          # remove NAs from lead and lag columns at the beginning
+          x.train.lag = x.train.lag[-(1:(t.step-1)),]
+          y.train.lag = y.train.lag[-(1:(t.step-1)),]
+          
+          # Regressors
+          if (n.features>1){
+            for (jreg in 1:(n.features-1)){
+              regressor.lag = regressorlag.list[[jreg]]
+              regressor.lag = regressor.lag[-(1:(t.step-1)),]
+              regressorlag.list[[jreg]] = regressor.lag
+            }
+          }
+          
+          # remove NAs from lead and lag columns at the end
+          x.train.lag = x.train.lag[1:(nrow(x.train.lag)-h),]
+          y.train.lag = y.train.lag[1:(nrow(y.train.lag)-h),]
+          
+          # Regressors
+          if (n.features>1){
+            for (jreg in 1:(n.features-1)){
+              regressor.lag = regressorlag.list[[jreg]]
+              regressor.lag = regressor.lag[1:(nrow(regressor.lag)-h),]
+              regressorlag.list[[jreg]] = regressor.lag
+            }    
+          }
+          
+          # Transform the input into tensors
+          
+          x.train = array(0, dim=c(dim(x.train.lag)[1], dim(x.train.lag)[2], n.features))
+          x.train[,,1] = data.matrix(x.train.lag)
+          
+          if(sum(is.na(x.train[,,1]))>0){stop()}
+          
+          X.train[((nn-1)*(M-h-t.step+1)+1):(nn*(M-h-t.step+1)),,1] = x.train[,,1]
+          
+          if (n.features>1){
+            for (jreg in 1:(n.features-1)){
+              regressor.lag = regressorlag.list[[jreg]]
+              x.train[,,jreg+1] = data.matrix(regressor.lag)
+              
+              X.train[((nn-1)*(M-h-t.step+1)+1):(nn*(M-h-t.step+1)),,jreg+1] = x.train[,,jreg+1]
+              
+            }
+          }
+          
+          y.train = data.matrix(y.train.lag)
+          
+          Y.train[((nn-1)*(M-h-t.step+1)+1):(nn*(M-h-t.step+1)),] = y.train
+          
+        } # end of training set for smart meters
+        
+      } # end n or smart meter loop
+      
+      # Here the LSTM model: one model for all the time series   
+      
+      if (j==1){        
+        # Build the LSTM model for all the smart meters
+        if(exists("model")){rm(model)} 
+        k_clear_session()
+        model <- keras_model_sequential()
+        
+        model %>%
+          layer_lstm(
+            units = 32,
+            # first layer needs to know the shape of the input data
+            input_shape = c(dim.tsteps,n.features), # indeed the first dim is ommited
+            activation = "tanh", # try others "relu", "softmax", "sigmoid"
+            # recurrent_activation = "relu", # try others
+            recurrent_dropout = 0.1, return_sequences = T) %>% # try other fractions to drop from recurrent state
+          # kernel_regularizer = regularizer_l2(l = 0.1), return_sequences = T) %>%
+          layer_dropout(rate=0.1) %>% # try other fractions to drop from this layer
+          #    layer_dense(units = 32, activation = "tanh") %>% layer_dropout(rate=0.2) %>%
+          layer_lstm(units = 16, activation = "tanh", recurrent_dropout = 0.05) %>% layer_dropout(rate=0.05) %>%
+          layer_dense(units = h) # by default, linear activation
+        
+        model %>%
+          compile(
+            loss = "mae", # we could try others
+            #    optimizer = "sgd", # try others
+            optimizer = optimizer_adam(lr = 0.001, beta_1 = 0.9, beta_2 = 0.999, decay = 1e-6),
+            #       optimizer = optimizer_rmsprop(),
+            #       optimizer = optimizer_sgd(lr = 0.01, momentum = 0, decay = 0, nesterov = FALSE),
+            # in addition to the loss, Keras will inform us about current MSE while training
+            metrics = list("mean_squared_error") # just to visualize other loss
+          )
+        
+        batch_size = 1000 # try several months...
+      }
+      
+      # Re-fit model using new data
+      
+      if (j==1){       
+        history <- model %>% fit(
+          x          = X.train,
+          y          = Y.train,
+          validation_data = list(X.test, Y.test),
+          batch_size = batch_size,
+          epochs     = 30  # 40 is better
+          # we may stop before epochs if the loss on the validation set does not decrease
+          # callbacks = list(callback_early_stopping(monitor = "val_loss", patience = 5))
+        )
+      }
+      
+      # Forecast for all smart meters:
+      for.rnn <- model %>% 
+        predict(X.test) 
+      
+
+      # Reverse transformation
+      if (transf){
+        for (nn in 1:N){
+          muZ = ParamNormalization$mu[nn]
+          sigmaZ = ParamNormalization$sigma[nn]
+          for.rnn[nn,] = denormalize(for.rnn[nn,], muZ, sigmaZ)
+        }
+      }
+      
+      for.rnn = pmax(exp(for.rnn)-1,0) 
+      
+      
+      # MAE for RNN for all smart meters at time j
+      maeRNN[,j,1] = rowSums(abs(for.rnn - Ztest))/h
+      
+      
+    } # end of if ((t %% (24*n.days))==0)
+    
+  } # end of backtesting or t loop1
+
+
+```
+
+```{r}
+
+colSums(apply(maeRNN, c(1,3), median))/N
+
+```
+
+```{r}
+
+colSums(apply(maeRNN, c(2,3), median))/dim(maeRNN)[2]
+
+```
+
+```{r}
+
+save(maeRNN, file = "maeRNN_ACORN-A.RData")
+
+
+```
+
+Summarize results by meter and time:
+
+```{r}
+
+load(file = "maeRNN_ACORN-A.RData")
+
+
+  N = dim(maeRNN)[1]
+  Nt = round(N*.8)
+
+  cat("N =",N, "smart meters, ", Nt, "in the training set", "\n")
+
+```
+
+```{r}
+
+ # Any NA in LSTM?
+  if(sum(is.na(maeRNN[,,1]))){
+    colSums(is.na(maeRNN[,,1]))
+    rowSums(is.na(maeRNN[,,1]))}
+
+  
+
+  a1=colSums(apply(maeRNN, c(1,3), median, na.rm=T))/N
+  a2=colSums(apply(maeRNN[c(1:Nt),,], c(1,3), median, na.rm=T))/Nt
+  a3=colSums(apply(maeRNN[c((Nt+1):N),,], c(1,3), median, na.rm=T))/(N-Nt)
+  b1=colSums(apply(maeRNN, c(2,3), median, na.rm=T))/dim(maeRNN)[2]
+
+  Table = data.frame(rbind(a1,a2,a3,b1))
+  Table = Table[,c(2,3,1)]
+  colnames(Table)=c("Naive","arima","LSTM")
+  rownames(Table)=c("MAE along all meters","MAE along training meters","MAE along testing meters","MAE along out-of-sample periods")
+  Table
+
+```
+
+```{r}
+
+  # LSTM is better than the others by:
+  1-Table[,3]/Table
+
+```
+
+```{r}
+
+boxplot(apply(maeRNN[c(1:Nt),,], c(1,3), median), main = "Out-of-sample median MAEs for meters in training", names=c("LSTM", "Naive", "auto.arima"), col="lightblue")
+  
+  boxplot(apply(maeRNN[c((Nt):N),,], c(1,3), median), main = "Out-of-sample median MAEs for meters in testing", names=c("LSTM", "Naive", "auto.arima"), col="lightblue")
+  
+
+  ts.plot(apply(maeRNN, c(2,3), median, na.rm=T), gpars = list(lwd=2,xlab="out-of-sample periods", ylab="Median MAEs", col = c("black", "red", "blue")))
+  legend("topleft", legend = c("LSTM", "Naive", "auto.arima"), col = c("black", "red", "blue"), lwd=2,lty = 1)
+
+
+
+```
+
+# **7 Summary**
+
+Flowchart for methodology: RNN for sequential data (time series)
+
+![](C:/Users/FAL/AppData/Local/RStudio/tmp/paste-427A2532.png)
+
+Main idea:train one single model for all the considered time series in a given group
+
+Once the model is trained, it can be used to forecast future loads not only for the smart meters considered in the training set but also for new smart meters
+
+The specific LSTM topology is
+
+![](C:/Users/FAL/AppData/Local/RStudio/tmp/paste-6D23C508.png)\
+**7.1 Some conclusions**
+
+-   The methodology can outperform competitive univariate forecasting tools for electricity consumption, providing an implementable and scalable approach for massive time series forecasting
+
+-   In particular, it may provide near real-time forecast for hundreds of thousands of smart meters
+
+**Hyperparameters**
+
+Main difficulty is in defining the network topology
+
+Then, optimize hyper-parameters:
+
+-   Units in each layer
+
+-   Activation functions in each layer
+
+-   Regularization, and dropout (including recurrent)
+
+-   Estimation window (M)
+
+-   Optimization algorithms (adam, sgd, rmsprop, ...) and associated hyperparameters (lr, beta_1, beta_2, ...)
+
+-   Loss function (mae, mse, ...)
+
+-   Etc. etc. etc.
+
+**Comments**
+
+-   A single but complex LSTM model can capture the main features of individual consumptions and also the cross-sectional relations from many time series
+
+-   For around 100 electricity smart-meters, the LSTM attains promising results respect to competitive benchmarks, around 20% better performance
+
+-   Not easily interpreted (black box)
+
+-   Typically require large amounts of data to perform well
+
+-   Are often very computationally expensive to train
+
+-   But if trained conveniently, it can perform very good
+
+-   LSTM tends to work good for multiple seasonality, high-frequency data, and non-linear relations
+
+-   Moreover, can train many time series at the same time, hence scaling well with massive data
+
+-   Success requires a large amount of experimentation with:
+
+    -   Model architecture (i.e. number and type of layers)
+
+    -   Hyperparameters (layer attributes, losses, learning rate, dropout, etc.)
+
+    -   Some frustration is inevitable!
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+
+
+
+```
