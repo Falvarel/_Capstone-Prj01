@@ -1,6 +1,6 @@
 # _Capstone-Prj01
 
-Capstone Projects: Future of electricity demand
+### Capstone Projects: Future of electricity demand
 
 AFI Finance Business School · Co-op (Mar 2021 - Feb 2022)
 
